@@ -5256,6 +5256,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         auto m_warptile_mmq_id128 = m_warptile_mmq;
         auto m_mmq_wg_denoms_id128 = m_mmq_wg_denoms;
         auto l_warptile_mmq_idw = l_warptile_mmq;
+        auto l_mmq_wg_denoms_idw = l_mmq_wg_denoms;
         uint32_t mmid_req_sgs = 0;
         {
             const char * tile16_env = getenv("GGML_VK_MMID_TILE16");
@@ -5319,12 +5320,29 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 wave32_tile(l_warptile_mmq_idw);
             }
         }
+        // GGML_VK_MMQID_CM: free-form tile overrides for the mmid coopmat clones above
+        // (compose after TILE16/BM64/M128/WAVE32, so unset fields keep their composed
+        // values only if the group is omitted — a present group replaces all 11 fields).
+        // Format identical to GGML_VK_MMQ_INT_K: "L:wg,bm,bn,bk,wm,wn,wniter,tm,tn,tk,warp;M:...;S:...".
+        // Caller must keep the shader invariants: NUM_WARPS == (BM/WM)*(BN/WN),
+        // WM >= TM, WN >= TN, and WARP == 32 while MMID_WAVE32 is active (its default).
+        if (const char * mmid_cm_env = getenv("GGML_VK_MMQID_CM")) {
+            ggml_vk_apply_mmq_tile_env(mmid_cm_env, l_warptile_mmq_idw, m_warptile_mmq_id128, s_warptile_mmq_id16,
+                                       l_mmq_wg_denoms_idw, m_mmq_wg_denoms_id128, s_mmq_wg_denoms_id16, "MMQID_CM");
+            for (const auto * w : {&l_warptile_mmq_idw, &m_warptile_mmq_id128, &s_warptile_mmq_id16}) {
+                GGML_ASSERT(w->size() == 11);
+                GGML_ASSERT((*w)[0] / (*w)[10] == ((*w)[1] / (*w)[4]) * ((*w)[2] / (*w)[5]));  // warp grid tiles BM x BN
+                GGML_ASSERT((*w)[4] >= (*w)[7] && (*w)[5] >= (*w)[8]);                          // WM >= TM, WN >= TN
+                GGML_ASSERT(mmid_req_sgs == 0 || (*w)[10] == mmid_req_sgs);                     // WARP matches forced subgroup size
+            }
+        }
         {
         const auto &s_warptile_mmq = s_warptile_mmq_id16;
         const auto &s_mmq_wg_denoms = s_mmq_wg_denoms_id16;
         const auto &m_warptile_mmq = m_warptile_mmq_id128;
         const auto &m_mmq_wg_denoms = m_mmq_wg_denoms_id128;
         const auto &l_warptile_mmq = l_warptile_mmq_idw;
+        const auto &l_mmq_wg_denoms = l_mmq_wg_denoms_idw;
 
         // Same expansion as CREATE_MM above, plus a trailing required subgroup
         // size (0 = driver default) for the GGML_VK_MMID_WAVE32 probe. Scoped to
