@@ -5320,20 +5320,44 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 wave32_tile(l_warptile_mmq_idw);
             }
         }
-        // GGML_VK_MMQID_CM: free-form tile overrides for the mmid coopmat clones above
-        // (compose after TILE16/BM64/M128/WAVE32, so unset fields keep their composed
-        // values only if the group is omitted — a present group replaces all 11 fields).
-        // Format identical to GGML_VK_MMQ_INT_K: "L:wg,bm,bn,bk,wm,wn,wniter,tm,tn,tk,warp;M:...;S:...".
-        // Caller must keep the shader invariants: NUM_WARPS == (BM/WM)*(BN/WN),
-        // WM >= TM, WN >= TN, and WARP == 32 while MMID_WAVE32 is active (its default).
+        // GGML_VK_MMQID_CM (v2): tile overrides for the mmid coopmat clones above
+        // (compose after TILE16/BM64/M128/WAVE32). Format per group:
+        //   "L:BLOCK_SIZE,BM,BN,BK,WM,WN,WMITER,x,x,x,WARP;M:...;S:..."
+        // Fields 8-10 (TM,TN,TK) are PARSED BUT IGNORED: on the coopmat path they are
+        // the device fragment shape (tm_*/tn_*/tk_* from coopmat_m/n/k), and a wrong
+        // fragment shape specialises mul_mm.comp into a GPU hang (observed: device
+        // reset + desktop loss). The invariant battery below runs at pipeline init,
+        // before any dispatch, so an illegal geometry aborts the process instead.
         if (const char * mmid_cm_env = getenv("GGML_VK_MMQID_CM")) {
             ggml_vk_apply_mmq_tile_env(mmid_cm_env, l_warptile_mmq_idw, m_warptile_mmq_id128, s_warptile_mmq_id16,
                                        l_mmq_wg_denoms_idw, m_mmq_wg_denoms_id128, s_mmq_wg_denoms_id16, "MMQID_CM");
-            for (const auto * w : {&l_warptile_mmq_idw, &m_warptile_mmq_id128, &s_warptile_mmq_id16}) {
-                GGML_ASSERT(w->size() == 11);
-                GGML_ASSERT((*w)[0] / (*w)[10] == ((*w)[1] / (*w)[4]) * ((*w)[2] / (*w)[5]));  // warp grid tiles BM x BN
-                GGML_ASSERT((*w)[4] >= (*w)[7] && (*w)[5] >= (*w)[8]);                          // WM >= TM, WN >= TN
-                GGML_ASSERT(mmid_req_sgs == 0 || (*w)[10] == mmid_req_sgs);                     // WARP matches forced subgroup size
+            const uint32_t tmcls[3]  = { device->coopmat_support ? device->coopmat_m : 4,
+                                          device->coopmat_support ? device->coopmat_m : 4,
+                                          device->coopmat_support ? device->coopmat_m : 2 };
+            const uint32_t tncls[3]  = { device->coopmat_support ? device->coopmat_n : 4,
+                                          device->coopmat_support ? device->coopmat_n : 2,
+                                          device->coopmat_support ? device->coopmat_n : 2 };
+            const uint32_t tkcls[3]  = { device->coopmat_support ? device->coopmat_k : 1,
+                                          device->coopmat_support ? device->coopmat_k : 1,
+                                          device->coopmat_support ? device->coopmat_k : 1 };
+            std::vector<uint32_t> * ws[3] = { &l_warptile_mmq_idw, &m_warptile_mmq_id128, &s_warptile_mmq_id16 };
+            for (int i = 0; i < 3; ++i) {
+                std::vector<uint32_t> & w = *ws[i];
+                GGML_ASSERT(w.size() == 11);
+                w[7] = tmcls[i];  // TM: device coopmat fragment, not tunable here
+                w[8] = tncls[i];  // TN
+                w[9] = tkcls[i];  // TK
+                const uint32_t bs = w[0], bm = w[1], bn = w[2], wm = w[4], wn = w[5],
+                               wmiter = w[6], tm = w[7], tn = w[8], warp = w[10];
+                GGML_ASSERT(bs % warp == 0 && bm % wm == 0 && bn % wn == 0);
+                GGML_ASSERT(bs / warp == (bm / wm) * (bn / wn));                      // warp grid covers tile
+                GGML_ASSERT((wm * wn) % (warp * tm * tn * wmiter) == 0);              // WNITER integral
+                const uint32_t wniter = (wm * wn) / (warp * tm * tn * wmiter);
+                GGML_ASSERT(wm % wmiter == 0 && wn % wniter == 0);                    // WSUBM / WSUBN
+                GGML_ASSERT((wm / wmiter) % tm == 0 && (wn / wniter) % tn == 0);      // fragment tiling of subwarps
+                GGML_ASSERT(mmid_req_sgs == 0 || warp == mmid_req_sgs);               // WARP matches forced subgroup size
+                fprintf(stderr, "ggml_vulkan: MMQID_CM %c tile wg=%u bm=%u bn=%u bk=%u wm=%u wn=%u wmiter=%u tm=%u tn=%u tk=%u warp=%u wniter=%u\n",
+                        "LMS"[i], bs, bm, bn, w[3], wm, wn, wmiter, tm, tn, tkcls[i], warp, wniter);
             }
         }
         {
